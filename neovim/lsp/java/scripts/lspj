@@ -1,0 +1,30 @@
+#!/bin/env bash
+
+###################################################################################################
+#
+# Helper script to setup files needed for Java Debugging in Neovim.
+#
+# Usage: lspj [--update | -u] [--fresh | -f] [--head | -h] [-t | --tree] [-o | -out]
+#
+# Description:
+#       -u, --update    Update and build the current repositories.
+#                       Uses the directory of your choice from the config file.
+#       -f, --fresh     Fresh setup. (Clones the repositories and then builds them.)
+#                       Uses the directory of your choice from the config file.
+#       -h, --head      Clone from latest commit. Use this if you don't like the default
+#                       strategy of cloning/pulling from latest tag.
+#       -o, --out       Output directory. Overrides the output directory declared on
+#                       the config files.
+#       -t, --tree      Separate the Java debug/test/decompiler files to their own sub-directories.
+#
+# Dependencies: Java ............ for obvious reasons..
+#               Git ............. to clone or pull the needed projects.
+#               Maven ........... to build the projects.
+#               Node ............ to build VSCode's Java Test project.
+#
+# NOTE: This script DOES NOT help in setting up your actual neovim config's JAVA LSP.
+#       This script just clones, builds, and puts the repos and files needed to your preferred
+#       directory, so that you'll just have to reference them in your neovim config.
+#       Kindly refer to the README for more details.
+#
+###################################################################################################
