@@ -1,0 +1,453 @@
+#!/bin/env bash
+
+###################################################################################################
+#
+# USAGE: jls [-f] [-h] [-t] [-o output_path]
+#            [-u]
+#            [-l]
+#            [-c hash]
+#            [-r hash]
+#            [-h]
+#
+# BUILDING:
+#        -u, --update         Updates and builds the repositories.
+#                             Uses the repositories and paths declared in the config file.
+#        -f, --fresh          Fresh setup. Clones and builds the repositories.
+#                             Uses the repositories and paths declared in the config file.
+#        -h, --head           Build from latest commit. Use this instead if you don't like the
+#                             default strategy of building from the latest tag.
+#
+# OUTPUT:
+#        -o, --out            [Optional] Output path. Overrides the output directory path
+#                             declared in the config file.
+#        -t, --tree           [Optional] Separate the Java lsp/debug/test/decompiler files to
+#                             their own sub-directories.
+#
+# ROLLBACK/SWITCHING:
+#        -l, --list           List previously built binary packages hashes.
+#        -c, --checkout       Switch to binary packages with the provided hash.
+#        -r, --rollback       Rollback to the binaries with the provided hash.
+#                             Defaults to the last buit binaries if no hash provided.
+#
+# MISC:
+#        -h, --help           Display usage documentation.
+###################################################################################################
+
+# Cleanup on exit
+trap cleanup EXIT
+
+# Paths
+readonly DEFAULT_BASE_PATH="${XDG_CONFIG_HOME:-~/.config/}"
+readonly DEFAULT_CONF_BASE_DIR="jls"
+
+# Print message types
+readonly INFO="INFO"
+readonly WARN="WARN"
+readonly ERROR="ERROR"
+
+# Default Repositories
+# Eclipse JDT LS
+readonly DEFAULT_JDTLS="https://github.com/eclipse/eclipse.jdt.ls.git"
+# Java debug
+readonly DEFAULT_VSCODE_DEBUG="https://github.com/microsoft/java-debug.git"
+# VSCode Test
+readonly DEFAULT_VSCODE_TEST="https://github.com/microsoft/vscode-java-test.git"
+# VSCode Java decompiler
+readonly DEFAULT_DECOMPILER="https://github.com/dgileadi/vscode-java-decompiler.git"
+
+# Colors
+readonly NORMAL=$(tput sgr0)
+readonly YELLOW=$(tput setaf 3)
+readonly RED=$(tput setaf 1)
+readonly GREEN=$(tput setaf 5)
+
+# Lockfile
+LOCKFILE=
+
+# Opts
+_arg_fresh=false
+_arg_update=false
+_arg_list=false
+_arg_describe=false
+_arg_use_head=false
+_arg_use_defaults=false
+_arg_checkout=
+_arg_rollback=
+_arg_verbose=false
+_arg_silent=false
+_arg_tree=false
+_arg_out=
+_arg_no_color=false
+
+# Create a lockfile to ensure that the script, particularly
+# the long running building or cloning are not going to be
+# re-run/interrupted.
+#
+# Args:
+#   None
+# Globals:
+#   LOCKFILE
+mk_lockfile() {
+  # A little bit of a non-easily guessable filename?
+  LOCKFILE=$(mktemp -t jjj88ls5553221.XXXXXXX)
+}
+
+# Cleanup on EXIT
+#
+# Args:
+#   None
+# Globals:
+#   LOCKFILE
+cleanup() {
+  if [ -e "${LOCKFILE}" ]; then
+    rm -f "${LOCKFILE}"
+  fi
+}
+
+# End execution with an exit code and an optional message.
+#
+# Args:
+# - $1 : Exit code.
+# - $2..$n : Message(s).
+# Globals:
+#   None
+terminate() {
+  # Collated message
+  local _term_msg=
+  # First argument is expected to be an exit code
+  declare -i _ret="${1:-1}"
+  shift
+  # Loop through the remaining arguments to form the message
+  for _msg in "$@"; do
+    _term_msg+="$_msg\n"
+  done
+
+  if ! $_arg_no_color; then
+    _term_msg="${RED}$_term_msg${NORMAL}"
+  fi
+
+  # Print the message to stderr
+  printf '%b' "$_term_msg" >&2
+
+  # Exit with the provided exit code.
+  exit "${_ret}"
+}
+
+# Print message to standard out.
+#
+# Args:
+# - $1 : Message Type.
+#   - INFO -- Messages to let user know about status or whatnot.
+#   - WARN -- Warning messages.
+#   - ERR  -- Execution Error messages.
+# - $2 : Actual Message.
+# Globals:
+#   config_path
+out() {
+  # Collated message
+  local _full_msg=
+  # Loop through the arguments to form the message
+  for _msg in "$@"; do
+    _full_msg+="$_msg\n"
+  done
+  # Print the message
+  printf '%b' "$_full_msg"
+}
+
+# Print usage/help.
+#
+# Args:
+#   None
+# Globals:
+#   None
+usage() {
+  out "USAGE: jls [[-f | --fresh] | [-u | --update]]"
+  out "           [[-f | --fresh] | [-u | --update]] [-D | --use-defaults]"
+  out "           [[-f | --fresh] | [-u| --update]] [[-v | --verbose] | [-q | --quiet]]"
+  out "           [[-f | --fresh] | [-u| --update]] [[-H | --head] [-t | --tree]] [-o | --out <output_path>]"
+  out "           [-l | --list]"
+  out "           [-d | --describe]"
+  out "           [-c | --checkout <hash>]"
+  out "           [-r | --rollback <hash>]"
+  out "           [-h | --help]"
+  out ""
+  out "Automates the updating (or cloning) and building of the required JDT LS repositories/binaries in order"
+  out "to use them as an LSP bundle. I.e.: referencing them with Neovim's LSP config."
+  out
+  out "XDG_CONFIG_HOME/jls directory is used to store and track the repositories."
+  out "This can be overriden by declaring a JLS_BASE (see below for the list) enviroment variable."
+  out "Make sure that you have write permissions to the directory you plan to use instead."
+  out ""
+  out "The following environment variables are used/expected:"
+  out "> JLS_JDT_LS    -- Eclipse JDT LS Git Repository"
+  out "> JLS_DEBUG     -- VSCode Java Debug Git Repository"
+  out "> JLS_TEST      -- VSCode Java Test Git Repository"
+  out "> JLS_DECOMPILE -- VSCode Java Test Git Repository"
+  out "> JLS_BASE      -- Optional base directory for jls"
+  out ""
+  out "DEFAULTS:"
+  out "Eclipse JDT LS Git Repository"
+  printf "> %s\n" "$DEFAULT_JDTLS"
+  out "VSCode Java Debug Git Repostory"
+  printf "> %s\n" "$DEFAULT_VSCODE_DEBUG"
+  out "VSCode Java Test Git Repository"
+  printf "> %s\n" "$DEFAULT_VSCODE_TEST"
+  out "VSCode Java Decompiler Git Repository"
+  printf "> %s\n" "$DEFAULT_DECOMPILER"
+  out "JLS BASE PATH"
+  out "> ~/.config/jls"
+  out
+  out "BUILDING:"
+  out "       -f, --fresh                Clones the repositories to JSL_BASE and then builds them."
+  out "       -u, --update               Updates and builds the current repositories."
+  out
+  out "BUILDING OPTIONS:"
+  out "       -D, --use-defaults         Use default paths and repositories and ignore any environment variables set."
+  out "                                  Note: This includes the JLS BASE path."
+  out "       -S  --server-only          Only build JDT LS and skip building debug bundles."
+  out "       -h, --head                 Build from latest commit. Use this instead if you don't like the"
+  out "                                  default strategy of building from the latest tag."
+  out
+  out "OUTPUT:"
+  out "       -o, --out <output_path>    [Optional] Output path. Overrides the default output path"
+  out "       -t, --tree                 [Optional] Separate the jdtls/debug/test/decompiler binaries to"
+  out "                                  their own sub-directories."
+  out
+  out "ROLLBACK/SWITCHING:"
+  out "       -l, --list                 List previously built binary packages hashes."
+  out "       -d, --describe             Show details about the currently active binaries."
+  out "       -c, --checkout <hash>      Switch to binary packages with the provided hash."
+  out "       -r, --rollback <hash>      Rollback to the binaries with the provided hash."
+  out "                                  Defaults to the last built binaries if no hash provided."
+  out
+  out "MISC:"
+  out "       -v, --verbose              Print everything."
+  out "       -s, --silent               Do not show anything."
+  out "       -N, --no-color             Do not color execution messages."
+  out "       -h, --help                 Display usage documentation."
+}
+
+# Evaluates whether a value passed to an option
+# does not match anything that looks like any long or short option.
+#
+# Args:
+#   $1: The name of the option
+#   $2: The passed value
+# Globals:
+#   None
+val_not_an_opt() {
+  if [[ "$2" =~ ^--?[a-zA-Z] ]]; then
+    terminate 1 \
+      "Error: Tried to pass an option($2) instead of the actual value for '$1'." \
+      "Try: jls -h | --help for usage"
+  fi
+}
+
+# Evaluates whether there was a value passed to an option.
+#
+# Args:
+#   $1: Arg count
+#   $2: Option name
+# Globals:
+#   None
+should_have_val() {
+  if [ "$1" -lt 2 ]; then
+    terminate 1 \
+      "Missing value for the option: '$2'." \
+      "Try: jls -h | --help for usage"
+  fi
+}
+
+# Validate options provided.
+#
+# Globals:
+#   config_path
+process_opts() {
+  echo "dog"
+}
+
+check_requirements() {
+  # Check dependencies.
+  # Git
+  if ! type git >>/dev/null; then
+    out "Git cannot be found. Kindly install or add to PATH."
+  fi
+}
+
+# Main
+#
+# Process script arguments.
+#
+# Globals:
+#   _arg_fresh
+#   _arg_update
+#   _arg_list
+#   _arg_describe
+#   _arg_use_head
+#   _arg_use_defaults
+#   _arg_checkout
+#   _arg_rollback
+#   _arg_verbose
+#   _arg_quiet
+#   _arg_tree
+#   _arg_out
+main() {
+  # Print help/usage if no options were provided.
+  if [ $# -eq 0 ]; then
+    usage
+    exit 1
+  fi
+  # Parse arguments provided
+  while test $# -gt 0; do
+    _key="$1"
+    case "$_key" in
+    # The update argurment doesn't accept a value,
+    # we expect the --fresh or -f, so we watch for them.
+    -f | --fresh)
+      _arg_fresh=true
+      ;;
+    # We support getopts-style short arguments clustering,
+    # so as -f doesn't accept value, other short options may be appended to it, so we watch for -f*.
+    # After stripping the leading -f from the argument, we have to make sure
+    # that the first character that follows coresponds to a short option.
+    -f*)
+      _arg_fresh=true
+      ;;
+    -u | --update)
+      _arg_update=true
+      ;;
+    -u*)
+      _arg_update=true
+      ;;
+    -D | --use-defaults)
+      _arg_use_defaults=true
+      ;;
+    -D*)
+      _arg_use_defaults=true
+      ;;
+    -H | --head)
+      _arg_use_head=true
+      ;;
+    -H*)
+      _arg_use_head=true
+      ;;
+    -t | --tree)
+      _arg_tree=true
+      ;;
+    -t*)
+      _arg_tree=true
+      ;;
+    # We support whitespace as a delimiter between option argument and its value.
+    # Therefore, we expect the --out or -o value.
+    # so we watch for --out and -o.
+    # Since we know that we got the long or short option,
+    # we just reach out for the next argument to get the value.
+    -o | --out)
+      # We should have a value for the this option.
+      should_have_val $# "$_key"
+      _arg_out="$2"
+      shift
+      # The value provided should not look like an option.
+      val_not_an_opt "$_key" "$_arg_out"
+      ;;
+    # We support the = as a delimiter between option argument and its value.
+    # Therefore, we expect --out=value, so we watch for --out=*
+    # For whatever we get, we strip '--out=' using the ${var##--out=} notation
+    # to get the argument value
+    --out=*)
+      _arg_out="${_key##--out=}"
+      val_not_an_opt "$_key" "$_arg_out"
+      ;;
+    # We support getopts-style short arguments grouping,
+    # so as -o accepts value, we allow it to be appended to it, so we watch for -o*
+    # and we strip the leading -o from the argument string using the ${var##-o} notation.
+    -o*)
+      _arg_out="${_key##-o}"
+      # The value provided should not look like an option.
+      val_not_an_opt "$_key" "$_arg_out"
+      ;;
+    -l | --list)
+      exit 0
+      ;;
+    -l*)
+      exit 0
+      ;;
+    -d | --describe)
+      exit 0
+      ;;
+    -d*)
+      exit 0
+      ;;
+    -r | --rollback)
+      # We should have a value for the this option.
+      should_have_val $# "$_key"
+      _arg_rollback="$2"
+      shift
+      # The value provided should not look like an option.
+      val_not_an_opt "$_key" "$_arg_rollback"
+      ;;
+    --rollback=*)
+      _arg_rollback="${_key##--rollback=}"
+      # The value provided should not look like an option.
+      val_not_an_opt "$_key" "$_arg_rollback"
+      ;;
+    -r*)
+      _arg_rollback="${_key##-r}"
+      # The value provided should not look like an option.
+      val_not_an_opt "$_key" "$_arg_rollback"
+      ;;
+    -c | --checkout)
+      # We should have a value for the this option.
+      should_have_val $# "$_key"
+      _arg_checkout="$2"
+      shift
+      # The value provided should not look like an option.
+      val_not_an_opt "$_key" "$_arg_checkout"
+      ;;
+    --checkout=*)
+      _arg_checkout="${_key##--checkout=}"
+      # The value provided should not look like an option.
+      val_not_an_opt "$_key" "$_arg_checkout"
+      ;;
+    -c*)
+      _arg_checkout="${_key##-c}"
+      # The value provided should not look like an option.
+      val_not_an_opt "$_key" "$_arg_checkout"
+      ;;
+    -v | --verbose)
+      _arg_verbose=true
+      ;;
+    -v*)
+      _arg_verbose=true
+      ;;
+    -s | --silent)
+      _arg_silent=true
+      ;;
+    -s*)
+      _arg_silent=true
+      ;;
+    -N | --no-color)
+      _arg_no_color=true
+      ;;
+    -N*)
+      _arg_no_color=true
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -h*)
+      usage
+      exit 0
+      ;;
+    *)
+      terminate 1 \
+        "Unexpected option: '$1'" \
+        "Try: jls -h | --help for usage."
+      ;;
+    esac
+    shift
+  done
+}
+
+main "$@"
